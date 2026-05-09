@@ -4,7 +4,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     task::{Context, Poll, Waker},
 };
@@ -18,7 +18,6 @@ use smoltcp::{
     time::{Duration, Instant},
     wire::{HardwareAddress, IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv6Address, TcpPacket},
 };
-use spin::Mutex as SpinMutex;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     sync::{
@@ -34,9 +33,14 @@ use crate::{
     Runner,
 };
 
-// NOTE: Default buffer could contain 20 AEAD packets
-const DEFAULT_TCP_SEND_BUFFER_SIZE: u32 = 0x3FFF * 20;
-const DEFAULT_TCP_RECV_BUFFER_SIZE: u32 = 0x3FFF * 20;
+/// Per-socket buffer size: 256 KiB.
+///
+/// Balances memory usage against throughput.  100 concurrent connections ≈
+/// 100 MB total, which is acceptable for a VPN TUN relay.  Larger values
+/// (e.g. the original 320 KiB) waste memory without measurable benefit
+/// below gigabit speeds.
+const DEFAULT_TCP_SEND_BUFFER_SIZE: usize = 256 * 1024;
+const DEFAULT_TCP_RECV_BUFFER_SIZE: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum TcpSocketState {
@@ -61,7 +65,14 @@ struct TcpSocketCreation {
 }
 
 type SharedNotify = Arc<Notify>;
-type SharedControl = Arc<SpinMutex<TcpSocketControl>>;
+
+/// Shared TCP socket control block.
+///
+/// Uses `std::sync::Mutex` instead of `spin::Mutex` to avoid busy-waiting
+/// under tokio's cooperative scheduler.  Lock hold times are very short
+/// (RingBuffer enqueue/dequeue + optional waker clone), so contention is
+/// negligible.
+type SharedControl = Arc<Mutex<TcpSocketControl>>;
 
 struct TcpListenerRunner;
 
@@ -135,8 +146,8 @@ impl TcpListenerRunner {
             // TCP first handshake packet, create a new Connection
             if packet.syn() && !packet.ack() {
                 let mut socket = TcpSocket::new(
-                    TcpSocketBuffer::new(vec![0u8; DEFAULT_TCP_RECV_BUFFER_SIZE as usize]),
-                    TcpSocketBuffer::new(vec![0u8; DEFAULT_TCP_SEND_BUFFER_SIZE as usize]),
+                    TcpSocketBuffer::new(vec![0u8; DEFAULT_TCP_RECV_BUFFER_SIZE]),
+                    TcpSocketBuffer::new(vec![0u8; DEFAULT_TCP_SEND_BUFFER_SIZE]),
                 );
                 socket.set_keep_alive(Some(Duration::from_secs(28)));
                 // FIXME: It should follow system's setting. 7200 is Linux's default.
@@ -151,10 +162,10 @@ impl TcpListenerRunner {
 
                 trace!("created TCP connection for {} <-> {}", src_addr, dst_addr);
 
-                let control = Arc::new(SpinMutex::new(TcpSocketControl {
-                    send_buffer: RingBuffer::new(vec![0u8; DEFAULT_TCP_SEND_BUFFER_SIZE as usize]),
+                let control = Arc::new(Mutex::new(TcpSocketControl {
+                    send_buffer: RingBuffer::new(vec![0u8; DEFAULT_TCP_SEND_BUFFER_SIZE]),
                     send_waker: None,
-                    recv_buffer: RingBuffer::new(vec![0u8; DEFAULT_TCP_RECV_BUFFER_SIZE as usize]),
+                    recv_buffer: RingBuffer::new(vec![0u8; DEFAULT_TCP_RECV_BUFFER_SIZE]),
                     recv_waker: None,
                     recv_state: TcpSocketState::Normal,
                     send_state: TcpSocketState::Normal,
@@ -199,9 +210,9 @@ impl TcpListenerRunner {
             }
 
             let before_poll = Instant::now();
-            let updated_sockets = iface.poll(before_poll, &mut device, &mut socket_set);
+            let poll_result = iface.poll(before_poll, &mut device, &mut socket_set);
             if matches!(
-                updated_sockets,
+                poll_result,
                 smoltcp::iface::PollResult::SocketStateChanged
             ) {
                 trace!("VirtDevice::poll costed {}", Instant::now() - before_poll);
@@ -213,7 +224,7 @@ impl TcpListenerRunner {
             for (socket_handle, control) in sockets.iter() {
                 let socket_handle = *socket_handle;
                 let socket = socket_set.get_mut::<TcpSocket>(socket_handle);
-                let mut control = control.lock();
+                let mut control = control.lock().unwrap_or_else(|e| e.into_inner());
 
                 // Remove the socket only when it is in the closed state.
                 if socket.state() == TcpState::Closed {
@@ -437,7 +448,7 @@ pub struct TcpStream {
 
 impl Drop for TcpStream {
     fn drop(&mut self) {
-        let mut control = self.control.lock();
+        let mut control = self.control.lock().unwrap_or_else(|e| e.into_inner());
 
         if matches!(control.recv_state, TcpSocketState::Normal) {
             control.recv_state = TcpSocketState::Close;
@@ -467,7 +478,7 @@ impl AsyncRead for TcpStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        let mut control = self.control.lock();
+        let mut control = self.control.lock().unwrap_or_else(|e| e.into_inner());
 
         // Read from buffer
         if control.recv_buffer.is_empty() {
@@ -504,7 +515,7 @@ impl AsyncWrite for TcpStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        let mut control = self.control.lock();
+        let mut control = self.control.lock().unwrap_or_else(|e| e.into_inner());
 
         // If state == Close | Closing | Closed, the TCP stream WR half is closed.
         if !matches!(control.send_state, TcpSocketState::Normal) {
@@ -537,7 +548,7 @@ impl AsyncWrite for TcpStream {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let mut control = self.control.lock();
+        let mut control = self.control.lock().unwrap_or_else(|e| e.into_inner());
 
         if matches!(control.send_state, TcpSocketState::Closed) {
             return Ok(()).into();

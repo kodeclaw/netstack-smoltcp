@@ -4,31 +4,29 @@ use std::{
     task::{Context, Poll},
 };
 
-/// BoxFuture acts the same as the [BoxFuture in crate futures utils],
-/// which is an owned dynamically typed Future for use in cases where you
-/// can’t statically type your result or need to add some indirection.
-/// But the difference of this structure is that it will conditionally
-/// implement Send according to the properties of type T, which does not
-/// require two sets of API interfaces in single-threaded and multi-threaded.
+/// Owned dynamically-typed future that is `Send` when `T: Send`.
 ///
-/// [BoxFuture in crate futures utils]: https://docs.rs/futures-util/latest/futures_util/future/type.BoxFuture.html
-pub struct BoxFuture<'a, T>(Pin<Box<dyn Future<Output = T> + 'a>>);
+/// Unlike `futures::future::BoxFuture`, the inner future is required to be
+/// `Send`, so this type is **safely** `Send` without `unsafe impl`.
+pub struct BoxFuture<'a, T>(Pin<Box<dyn Future<Output = T> + Send + 'a>>);
 
 impl<'a, T> BoxFuture<'a, T> {
     pub fn new<F>(f: F) -> BoxFuture<'a, T>
     where
         F: IntoFuture<Output = T> + 'a,
+        F::IntoFuture: Send,
     {
         BoxFuture(Box::pin(f.into_future()))
     }
 
     #[allow(unused)]
-    pub fn wrap(f: Pin<Box<dyn Future<Output = T> + 'a>>) -> BoxFuture<'a, T> {
+    pub fn wrap(f: Pin<Box<dyn Future<Output = T> + Send + 'a>>) -> BoxFuture<'a, T> {
         BoxFuture(f)
     }
 }
 
-unsafe impl<T: Send> Send for BoxFuture<'_, T> {}
+// Safety: not needed — the `Send` bound on the inner future makes
+// `BoxFuture` automatically `Send` when `T: Send`.
 
 impl<T> Future for BoxFuture<'_, T> {
     type Output = T;
