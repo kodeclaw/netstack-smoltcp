@@ -4,8 +4,9 @@ use std::{
     task::{Context, Poll},
 };
 
+use bytes::Bytes;
 use etherparse::PacketBuilder;
-use futures::{ready, Sink, SinkExt, Stream};
+use futures::{Sink, SinkExt, Stream, ready};
 use smoltcp::wire::UdpPacket;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_util::sync::PollSender;
@@ -14,7 +15,7 @@ use tracing::{error, trace};
 use crate::packet::{AnyIpPktFrame, IpPacket};
 
 pub type UdpMsg = (
-    Vec<u8>,    /* payload */
+    Bytes,      /* payload */
     SocketAddr, /* local */
     SocketAddr, /* remote */
 );
@@ -58,7 +59,7 @@ impl Stream for ReadHalf {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         self.udp_rx.poll_recv(cx).map(|item| {
             item.and_then(|frame| {
-                let packet = match IpPacket::new_checked(frame.as_slice()) {
+                let packet = match IpPacket::new_checked(&frame[..]) {
                     Ok(p) => p,
                     Err(err) => {
                         error!("invalid IP packet: {}", err);
@@ -85,7 +86,7 @@ impl Stream for ReadHalf {
 
                 trace!("created UDP socket for {} <-> {}", src_addr, dst_addr);
 
-                Some((packet.payload().to_vec(), src_addr, dst_addr))
+                Some((Bytes::copy_from_slice(packet.payload()), src_addr, dst_addr))
             })
         })
     }
@@ -128,7 +129,10 @@ impl Sink<UdpMsg> for WriteHalf {
             .write(&mut ip_packet_writer, &data)
             .map_err(|err| Error::other(format!("PacketBuilder::write: {err}")))?;
 
-        match self.stack_tx.start_send_unpin(ip_packet_writer) {
+        match self
+            .stack_tx
+            .start_send_unpin(Bytes::from(ip_packet_writer))
+        {
             Ok(()) => Ok(()),
             Err(err) => Err(Error::other(format!("send error: {err}"))),
         }

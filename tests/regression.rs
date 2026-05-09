@@ -67,7 +67,8 @@ async fn bug1_poll_ready_waker_registered_via_send_all() {
     let pkt1 = make_udp_ipv4([1, 2, 3, 4], 1111, [5, 6, 7, 8], 9999, b"first");
     let pkt2 = make_udp_ipv4([1, 2, 3, 4], 1111, [5, 6, 7, 8], 9999, b"second");
 
-    let mut stream = futures::stream::iter([Ok(pkt1), Ok(pkt2)]);
+    let mut stream =
+        futures::stream::iter([Ok(bytes::Bytes::from(pkt1)), Ok(bytes::Bytes::from(pkt2))]);
 
     let result = timeout(Duration::from_secs(1), stack.send_all(&mut stream)).await;
     // should be ok after the fix

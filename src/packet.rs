@@ -1,8 +1,9 @@
 use std::net::IpAddr;
 
+use bytes::Bytes;
 use smoltcp::wire::{IpProtocol, IpVersion, Ipv4Packet, Ipv6Packet};
 
-pub type AnyIpPktFrame = Vec<u8>;
+pub type AnyIpPktFrame = Bytes;
 
 #[derive(Debug)]
 pub(super) enum IpPacket<T: AsRef<[u8]>> {

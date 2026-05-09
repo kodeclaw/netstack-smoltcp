@@ -1,12 +1,12 @@
 use std::{
     net::IpAddr,
     pin::Pin,
-    task::{ready, Context, Poll},
+    task::{Context, Poll, ready},
 };
 
 use futures::{Sink, Stream};
 use smoltcp::wire::IpProtocol;
-use tokio::sync::mpsc::{channel, Receiver};
+use tokio::sync::mpsc::{Receiver, channel};
 use tokio_util::sync::PollSender;
 use tracing::{debug, trace};
 
@@ -233,7 +233,7 @@ impl Sink<AnyIpPktFrame> for Stack {
         }
 
         use std::io::{Error, ErrorKind::InvalidInput};
-        let packet = IpPacket::new_checked(item.as_slice())
+        let packet = IpPacket::new_checked(&item[..])
             .map_err(|err| Error::new(InvalidInput, format!("invalid IP packet: {err}")))?;
 
         let src_ip = packet.src_addr();

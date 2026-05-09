@@ -136,7 +136,7 @@ async fn main_exec(opt: Opt) {
     futs.push(tokio_spawn!(async move {
         while let Some(pkt) = stack_stream.next().await {
             if let Ok(pkt) = pkt {
-                match tun_sink.send(pkt).await {
+                match tun_sink.send(pkt.to_vec()).await {
                     Ok(_) => {}
                     Err(e) => warn!("failed to send packet to TUN, err: {:?}", e),
                 }
@@ -148,7 +148,7 @@ async fn main_exec(opt: Opt) {
     futs.push(tokio_spawn!(async move {
         while let Some(pkt) = tun_stream.next().await {
             if let Ok(pkt) = pkt {
-                match stack_sink.send(pkt).await {
+                match stack_sink.send(pkt.into()).await {
                     Ok(_) => {}
                     Err(e) => warn!("failed to send packet to stack, err: {:?}", e),
                 };
@@ -229,7 +229,11 @@ async fn handle_inbound_datagram(udp_socket: UdpSocket, interface: String) {
                         let mut buf = vec![0; 1024];
                         match remote_socket.recv_from(&mut buf).await {
                             Ok((len, _)) => {
-                                let _ = tx.send((buf[..len].to_vec(), local, remote));
+                                let _ = tx.send((
+                                    bytes::Bytes::copy_from_slice(&buf[..len]),
+                                    local,
+                                    remote,
+                                ));
                             }
                             Err(e) => {
                                 warn!(
@@ -250,7 +254,7 @@ async fn handle_inbound_datagram(udp_socket: UdpSocket, interface: String) {
     }
 }
 
-async fn new_tcp_stream<'a>(addr: SocketAddr, iface: &str) -> std::io::Result<TcpStream> {
+async fn new_tcp_stream(addr: SocketAddr, iface: &str) -> std::io::Result<TcpStream> {
     use socket2_ext::{AddressBinding, BindDeviceOption};
     let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?;
     socket.bind_to_device(BindDeviceOption::v4(iface))?;

@@ -3,13 +3,14 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::{
+        Arc,
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
     },
     task::{Context, Poll, Waker},
 };
 
 use futures::Stream;
+use parking_lot::Mutex;
 use smoltcp::{
     iface::{Config as InterfaceConfig, Interface, SocketHandle, SocketSet},
     phy::Device,
@@ -21,26 +22,23 @@ use smoltcp::{
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     sync::{
-        mpsc::{unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender},
         Notify,
+        mpsc::{Receiver, Sender, channel},
     },
 };
 use tracing::{error, trace};
 
 use crate::{
+    Runner,
     device::VirtualDevice,
     packet::{AnyIpPktFrame, IpPacket},
-    Runner,
 };
 
-/// Per-socket buffer size: 256 KiB.
+/// Per-socket buffer size: 64 KiB.
 ///
-/// Balances memory usage against throughput.  100 concurrent connections ≈
-/// 100 MB total, which is acceptable for a VPN TUN relay.  Larger values
-/// (e.g. the original 320 KiB) waste memory without measurable benefit
-/// below gigabit speeds.
-const DEFAULT_TCP_SEND_BUFFER_SIZE: usize = 256 * 1024;
-const DEFAULT_TCP_RECV_BUFFER_SIZE: usize = 256 * 1024;
+/// Balances memory usage against throughput. 64 KiB is a good default for VPN TUN relay.
+const DEFAULT_TCP_SEND_BUFFER_SIZE: usize = 64 * 1024;
+const DEFAULT_TCP_RECV_BUFFER_SIZE: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum TcpSocketState {
@@ -68,10 +66,7 @@ type SharedNotify = Arc<Notify>;
 
 /// Shared TCP socket control block.
 ///
-/// Uses `std::sync::Mutex` instead of `spin::Mutex` to avoid busy-waiting
-/// under tokio's cooperative scheduler.  Lock hold times are very short
-/// (RingBuffer enqueue/dequeue + optional waker clone), so contention is
-/// negligible.
+/// Uses `parking_lot::Mutex` to avoid thread blocking.
 type SharedControl = Arc<Mutex<TcpSocketControl>>;
 
 struct TcpListenerRunner;
@@ -80,15 +75,15 @@ impl TcpListenerRunner {
     fn create(
         device: VirtualDevice,
         iface: Interface,
-        iface_ingress_tx: UnboundedSender<Vec<u8>>,
+        iface_ingress_tx: Sender<AnyIpPktFrame>,
         iface_ingress_tx_avail: Arc<AtomicBool>,
         tcp_rx: Receiver<AnyIpPktFrame>,
-        stream_tx: UnboundedSender<TcpStream>,
+        stream_tx: Sender<TcpStream>,
         sockets: HashMap<SocketHandle, SharedControl>,
     ) -> Runner {
         Runner::new(async move {
             let notify = Arc::new(Notify::new());
-            let (socket_tx, socket_rx) = unbounded_channel::<TcpSocketCreation>();
+            let (socket_tx, socket_rx) = channel::<TcpSocketCreation>(1024);
             let res = tokio::select! {
                 v = Self::handle_packet(notify.clone(), iface_ingress_tx, iface_ingress_tx_avail.clone(), tcp_rx, stream_tx, socket_tx) => v,
                 v = Self::handle_socket(notify, device, iface, iface_ingress_tx_avail, sockets, socket_rx) => v,
@@ -101,14 +96,14 @@ impl TcpListenerRunner {
 
     async fn handle_packet(
         notify: SharedNotify,
-        iface_ingress_tx: UnboundedSender<Vec<u8>>,
+        iface_ingress_tx: Sender<AnyIpPktFrame>,
         iface_ingress_tx_avail: Arc<AtomicBool>,
         mut tcp_rx: Receiver<AnyIpPktFrame>,
-        stream_tx: UnboundedSender<TcpStream>,
-        socket_tx: UnboundedSender<TcpSocketCreation>,
+        stream_tx: Sender<TcpStream>,
+        socket_tx: Sender<TcpSocketCreation>,
     ) -> std::io::Result<()> {
         while let Some(frame) = tcp_rx.recv().await {
-            let packet = match IpPacket::new_checked(frame.as_slice()) {
+            let packet = match IpPacket::new_checked(&frame[..]) {
                 Ok(p) => p,
                 Err(err) => {
                     error!("invalid TCP IP packet: {:?}", err,);
@@ -120,6 +115,7 @@ impl TcpListenerRunner {
             if matches!(packet.protocol(), IpProtocol::Icmp | IpProtocol::Icmpv6) {
                 iface_ingress_tx
                     .send(frame)
+                    .await
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
                 iface_ingress_tx_avail.store(true, Ordering::Release);
                 notify.notify_one();
@@ -133,7 +129,9 @@ impl TcpListenerRunner {
             let packet = match TcpPacket::new_checked(payload) {
                 Ok(p) => p,
                 Err(err) => {
-                    error!("invalid TCP err: {err}, src_ip: {src_ip}, dst_ip: {dst_ip}, payload: {payload:?}");
+                    error!(
+                        "invalid TCP err: {err}, src_ip: {src_ip}, dst_ip: {dst_ip}, payload: {payload:?}"
+                    );
                     continue;
                 }
             };
@@ -178,15 +176,18 @@ impl TcpListenerRunner {
                         notify: notify.clone(),
                         control: control.clone(),
                     })
+                    .await
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
                 socket_tx
                     .send(TcpSocketCreation { control, socket })
+                    .await
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
             }
 
             // Pipeline tcp stream packet
             iface_ingress_tx
                 .send(frame)
+                .await
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
             iface_ingress_tx_avail.store(true, Ordering::Release);
             notify.notify_one();
@@ -200,7 +201,7 @@ impl TcpListenerRunner {
         mut iface: Interface,
         iface_ingress_tx_avail: Arc<AtomicBool>,
         mut sockets: HashMap<SocketHandle, SharedControl>,
-        mut socket_rx: UnboundedReceiver<TcpSocketCreation>,
+        mut socket_rx: Receiver<TcpSocketCreation>,
     ) -> std::io::Result<()> {
         let mut socket_set = SocketSet::new(vec![]);
         loop {
@@ -211,10 +212,9 @@ impl TcpListenerRunner {
 
             let before_poll = Instant::now();
             let poll_result = iface.poll(before_poll, &mut device, &mut socket_set);
-            if matches!(
-                poll_result,
-                smoltcp::iface::PollResult::SocketStateChanged
-            ) {
+            let state_changed =
+                matches!(poll_result, smoltcp::iface::PollResult::SocketStateChanged);
+            if state_changed {
                 trace!("VirtDevice::poll costed {}", Instant::now() - before_poll);
             }
 
@@ -224,7 +224,7 @@ impl TcpListenerRunner {
             for (socket_handle, control) in sockets.iter() {
                 let socket_handle = *socket_handle;
                 let socket = socket_set.get_mut::<TcpSocket>(socket_handle);
-                let mut control = control.lock().unwrap_or_else(|e| e.into_inner());
+                let mut control = control.lock();
 
                 // Remove the socket only when it is in the closed state.
                 if socket.state() == TcpState::Closed {
@@ -304,10 +304,8 @@ impl TcpListenerRunner {
                     wake_receiver = true;
                 }
 
-                if wake_receiver && control.recv_waker.is_some() {
-                    if let Some(waker) = control.recv_waker.take() {
-                        waker.wake();
-                    }
+                if wake_receiver && let Some(waker) = control.recv_waker.take() {
+                    waker.wake();
                 }
 
                 // Check if writable
@@ -337,10 +335,8 @@ impl TcpListenerRunner {
                     }
                 }
 
-                if wake_sender && control.send_waker.is_some() {
-                    if let Some(waker) = control.send_waker.take() {
-                        waker.wake();
-                    }
+                if wake_sender && let Some(waker) = control.send_waker.take() {
+                    waker.wake();
                 }
             }
 
@@ -366,7 +362,7 @@ impl TcpListenerRunner {
 }
 
 pub struct TcpListener {
-    stream_rx: UnboundedReceiver<TcpStream>,
+    stream_rx: Receiver<TcpStream>,
 }
 
 impl TcpListener {
@@ -379,7 +375,7 @@ impl TcpListener {
             VirtualDevice::new(stack_tx, mtu);
         let iface = Self::create_interface(&mut device)?;
 
-        let (stream_tx, stream_rx) = unbounded_channel();
+        let (stream_tx, stream_rx) = channel(1024);
 
         let runner = TcpListenerRunner::create(
             device,
@@ -448,7 +444,7 @@ pub struct TcpStream {
 
 impl Drop for TcpStream {
     fn drop(&mut self) {
-        let mut control = self.control.lock().unwrap_or_else(|e| e.into_inner());
+        let mut control = self.control.lock();
 
         if matches!(control.recv_state, TcpSocketState::Normal) {
             control.recv_state = TcpSocketState::Close;
@@ -478,7 +474,7 @@ impl AsyncRead for TcpStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        let mut control = self.control.lock().unwrap_or_else(|e| e.into_inner());
+        let mut control = self.control.lock();
 
         // Read from buffer
         if control.recv_buffer.is_empty() {
@@ -488,10 +484,10 @@ impl AsyncRead for TcpStream {
             }
 
             // Nothing could be read. Wait for notify.
-            if let Some(old_waker) = control.recv_waker.replace(cx.waker().clone()) {
-                if !old_waker.will_wake(cx.waker()) {
-                    old_waker.wake();
-                }
+            if let Some(old_waker) = control.recv_waker.replace(cx.waker().clone())
+                && !old_waker.will_wake(cx.waker())
+            {
+                old_waker.wake();
             }
 
             return Poll::Pending;
@@ -515,7 +511,7 @@ impl AsyncWrite for TcpStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        let mut control = self.control.lock().unwrap_or_else(|e| e.into_inner());
+        let mut control = self.control.lock();
 
         // If state == Close | Closing | Closed, the TCP stream WR half is closed.
         if !matches!(control.send_state, TcpSocketState::Normal) {
@@ -525,10 +521,10 @@ impl AsyncWrite for TcpStream {
         // Write to buffer
 
         if control.send_buffer.is_full() {
-            if let Some(old_waker) = control.send_waker.replace(cx.waker().clone()) {
-                if !old_waker.will_wake(cx.waker()) {
-                    old_waker.wake();
-                }
+            if let Some(old_waker) = control.send_waker.replace(cx.waker().clone())
+                && !old_waker.will_wake(cx.waker())
+            {
+                old_waker.wake();
             }
 
             return Poll::Pending;
@@ -548,7 +544,7 @@ impl AsyncWrite for TcpStream {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let mut control = self.control.lock().unwrap_or_else(|e| e.into_inner());
+        let mut control = self.control.lock();
 
         if matches!(control.send_state, TcpSocketState::Closed) {
             return Ok(()).into();
@@ -559,10 +555,10 @@ impl AsyncWrite for TcpStream {
             control.send_state = TcpSocketState::Close;
         }
 
-        if let Some(old_waker) = control.send_waker.replace(cx.waker().clone()) {
-            if !old_waker.will_wake(cx.waker()) {
-                old_waker.wake();
-            }
+        if let Some(old_waker) = control.send_waker.replace(cx.waker().clone())
+            && !old_waker.will_wake(cx.waker())
+        {
+            old_waker.wake();
         }
 
         self.notify.notify_one();

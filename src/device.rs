@@ -1,19 +1,20 @@
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 
+use bytes::BytesMut;
 use smoltcp::{
     phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
     time::Instant,
 };
-use tokio::sync::mpsc::{unbounded_channel, Permit, Sender, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{Permit, Receiver, Sender, channel};
 
 use crate::packet::AnyIpPktFrame;
 
 pub(super) struct VirtualDevice {
     in_buf_avail: Arc<AtomicBool>,
-    in_buf: UnboundedReceiver<Vec<u8>>,
+    in_buf: Receiver<AnyIpPktFrame>,
     out_buf: Sender<AnyIpPktFrame>,
     mtu: usize,
 }
@@ -22,9 +23,10 @@ impl VirtualDevice {
     pub(super) fn new(
         iface_egress_tx: Sender<AnyIpPktFrame>,
         mtu: usize,
-    ) -> (Self, UnboundedSender<Vec<u8>>, Arc<AtomicBool>) {
+    ) -> (Self, Sender<AnyIpPktFrame>, Arc<AtomicBool>) {
         let iface_ingress_tx_avail = Arc::new(AtomicBool::new(false));
-        let (iface_ingress_tx, iface_ingress_rx) = unbounded_channel();
+        // Use a bounded channel for backpressure. 1024 packets is reasonable buffering.
+        let (iface_ingress_tx, iface_ingress_rx) = channel(1024);
         (
             Self {
                 in_buf_avail: iface_ingress_tx_avail.clone(),
@@ -72,7 +74,7 @@ impl Device for VirtualDevice {
 }
 
 pub(super) struct VirtualRxToken {
-    buffer: Vec<u8>,
+    buffer: AnyIpPktFrame,
 }
 
 impl RxToken for VirtualRxToken {
@@ -85,7 +87,7 @@ impl RxToken for VirtualRxToken {
 }
 
 pub(super) struct VirtualTxToken<'a> {
-    permit: Permit<'a, Vec<u8>>,
+    permit: Permit<'a, AnyIpPktFrame>,
 }
 
 impl<'a> TxToken for VirtualTxToken<'a> {
@@ -93,9 +95,9 @@ impl<'a> TxToken for VirtualTxToken<'a> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buffer = vec![0u8; len];
+        let mut buffer = BytesMut::zeroed(len);
         let result = f(&mut buffer);
-        self.permit.send(buffer);
+        self.permit.send(buffer.freeze());
         result
     }
 }
