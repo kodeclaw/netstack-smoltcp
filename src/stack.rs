@@ -232,9 +232,13 @@ impl Sink<AnyIpPktFrame> for Stack {
             return Ok(());
         }
 
-        use std::io::{Error, ErrorKind::InvalidInput};
-        let packet = IpPacket::new_checked(&item[..])
-            .map_err(|err| Error::new(InvalidInput, format!("invalid IP packet: {err}")))?;
+        let packet = match IpPacket::new_checked(&item[..]) {
+            Ok(p) => p,
+            Err(err) => {
+                debug!("dropping malformed IP packet ({} bytes): {err}", item.len());
+                return Ok(());
+            }
+        };
 
         let src_ip = packet.src_addr();
         let dst_ip = packet.dst_addr();

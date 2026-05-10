@@ -268,17 +268,17 @@ impl TcpListenerRunner {
                     match result {
                         Ok(..) => wake_receiver = true,
                         Err(err) => {
-                            error!("socket recv error: {:?}, {:?}", err, socket.state());
-
-                            // Don't know why. Abort the connection.
-                            socket.abort();
+                            // RecvError::Finished = remote peer sent FIN (graceful close).
+                            // Use close() instead of abort() to avoid sending an unnecessary RST.
+                            trace!("socket recv finished: {:?}, state={:?}", err, socket.state());
+                            socket.close();
 
                             if matches!(control.recv_state, TcpSocketState::Normal) {
                                 control.recv_state = TcpSocketState::Closed;
                             }
                             wake_receiver = true;
 
-                            // The socket will be recycled in the next poll.
+                            // The socket will transition to Closed in subsequent polls.
                             break;
                         }
                     }
@@ -319,17 +319,17 @@ impl TcpListenerRunner {
                     match result {
                         Ok(..) => wake_sender = true,
                         Err(err) => {
-                            error!("socket send error: {:?}, {:?}", err, socket.state());
-
-                            // Don't know why. Abort the connection.
-                            socket.abort();
+                            // SendError::Unaddressable = connection shutting down.
+                            // Use close() for graceful FIN instead of abort() (RST).
+                            trace!("socket send error: {:?}, state={:?}", err, socket.state());
+                            socket.close();
 
                             if matches!(control.send_state, TcpSocketState::Normal) {
                                 control.send_state = TcpSocketState::Closed;
                             }
                             wake_sender = true;
 
-                            // The socket will be recycled in the next poll.
+                            // The socket will transition to Closed in subsequent polls.
                             break;
                         }
                     }
