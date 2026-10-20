@@ -45,12 +45,14 @@ impl Device for VirtualDevice {
     type TxToken<'a> = VirtualTxToken<'a>;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let Ok(buffer) = self.in_buf.try_recv() else {
+        // Reserve the response slot before dequeuing input. Otherwise, a full
+        // egress queue would permanently discard a received packet.
+        let Ok(permit) = self.out_buf.try_reserve() else {
             self.in_buf_avail.store(false, Ordering::Release);
             return None;
         };
 
-        let Ok(permit) = self.out_buf.try_reserve() else {
+        let Ok(buffer) = self.in_buf.try_recv() else {
             self.in_buf_avail.store(false, Ordering::Release);
             return None;
         };
@@ -99,5 +101,30 @@ impl<'a> TxToken for VirtualTxToken<'a> {
         let result = f(&mut buffer);
         self.permit.send(buffer.freeze());
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_egress_queue_does_not_discard_ingress_packet() {
+        let (egress_tx, mut egress_rx) = channel(1);
+        egress_tx
+            .try_send(BytesMut::from(&b"egress"[..]).freeze())
+            .unwrap();
+        let (mut device, ingress_tx, _) = VirtualDevice::new(egress_tx, 1500);
+        ingress_tx
+            .try_send(BytesMut::from(&b"ingress"[..]).freeze())
+            .unwrap();
+
+        assert!(device.receive(Instant::now()).is_none());
+        assert_eq!(&egress_rx.try_recv().unwrap()[..], b"egress");
+
+        let (rx, _tx) = device
+            .receive(Instant::now())
+            .expect("the packet must still be queued after egress backpressure");
+        assert_eq!(rx.consume(|packet| packet.to_vec()), b"ingress");
     }
 }
