@@ -1,8 +1,8 @@
 [package]
 name = "netstack-smoltcp"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
-authors = ["cavivie <cavivie@gmail.com>", "Antigravity", "ChatGPT"]
+authors = ["cavivie <cavivie@gmail.com>", "Antigravity", "ChatGPT", "StudioCat"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/kodeclaw/netstack-smoltcp"
 homepage = "https://github.com/kodeclaw/netstack-smoltcp"
