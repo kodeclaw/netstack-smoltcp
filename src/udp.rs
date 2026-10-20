@@ -57,38 +57,41 @@ impl Stream for ReadHalf {
     type Item = UdpMsg;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        self.udp_rx.poll_recv(cx).map(|item| {
-            item.and_then(|frame| {
-                let packet = match IpPacket::new_checked(&frame[..]) {
-                    Ok(p) => p,
-                    Err(err) => {
-                        error!("invalid IP packet: {}", err);
-                        return None;
-                    }
-                };
+        loop {
+            let Some(frame) = ready!(self.udp_rx.poll_recv(cx)) else {
+                return Poll::Ready(None);
+            };
+            let packet = match IpPacket::new_checked(&frame[..]) {
+                Ok(p) => p,
+                Err(err) => {
+                    error!("invalid IP packet: {}", err);
+                    continue;
+                }
+            };
 
-                let src_ip = packet.src_addr();
-                let dst_ip = packet.dst_addr();
-                let payload = packet.payload();
+            let src_ip = packet.src_addr();
+            let dst_ip = packet.dst_addr();
+            let payload = packet.payload();
 
-                let packet = match UdpPacket::new_checked(payload) {
-                    Ok(p) => p,
-                    Err(err) => {
-                        error!("invalid err: {err}, src_ip: {src_ip}, dst_ip: {dst_ip}, payload: {payload:?}");
-                        return None;
-                    }
-                };
-                let src_port = packet.src_port();
-                let dst_port = packet.dst_port();
+            let packet = match UdpPacket::new_checked(payload) {
+                Ok(p) => p,
+                Err(err) => {
+                    error!(
+                        "invalid err: {err}, src_ip: {src_ip}, dst_ip: {dst_ip}, payload: {payload:?}"
+                    );
+                    continue;
+                }
+            };
+            let src_addr = SocketAddr::new(src_ip, packet.src_port());
+            let dst_addr = SocketAddr::new(dst_ip, packet.dst_port());
 
-                let src_addr = SocketAddr::new(src_ip, src_port);
-                let dst_addr = SocketAddr::new(dst_ip, dst_port);
-
-                trace!("created UDP socket for {} <-> {}", src_addr, dst_addr);
-
-                Some((Bytes::copy_from_slice(packet.payload()), src_addr, dst_addr))
-            })
-        })
+            trace!("created UDP socket for {} <-> {}", src_addr, dst_addr);
+            return Poll::Ready(Some((
+                Bytes::copy_from_slice(packet.payload()),
+                src_addr,
+                dst_addr,
+            )));
+        }
     }
 }
 
@@ -105,10 +108,6 @@ impl Sink<UdpMsg> for WriteHalf {
     fn start_send(mut self: Pin<&mut Self>, item: UdpMsg) -> Result<(), Self::Error> {
         use std::io::{Error, ErrorKind::InvalidData};
         let (data, src_addr, dst_addr) = item;
-
-        if data.is_empty() {
-            return Ok(());
-        }
 
         let builder = match (src_addr, dst_addr) {
             (SocketAddr::V4(src), SocketAddr::V4(dst)) => {

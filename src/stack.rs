@@ -108,6 +108,18 @@ impl StackBuilder {
         Option<UdpSocket>,
         Option<TcpListener>,
     )> {
+        use std::io::{Error, ErrorKind::InvalidInput};
+
+        if self.stack_buffer_size == 0
+            || (self.enable_udp && self.udp_buffer_size == 0)
+            || (self.enable_tcp && self.tcp_buffer_size == 0)
+        {
+            return Err(Error::new(
+                InvalidInput,
+                "enabled channel buffer sizes must be greater than zero",
+            ));
+        }
+
         let (stack_tx, stack_rx) = channel(self.stack_buffer_size);
 
         let (udp_tx, udp_rx) = if self.enable_udp {
@@ -127,7 +139,6 @@ impl StackBuilder {
         // ICMP is handled by TCP's Interface.
         // smoltcp's interface will always send replies to EchoRequest
         if self.enable_icmp && !self.enable_tcp {
-            use std::io::{Error, ErrorKind::InvalidInput};
             return Err(Error::new(InvalidInput, "ICMP requires TCP"));
         }
         let icmp_tx = if self.enable_icmp {
@@ -266,10 +277,8 @@ impl Sink<AnyIpPktFrame> for Stack {
         self.poll_send(cx)
     }
 
-    fn poll_close(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        ready!(self.poll_send(cx))?;
         self.stack_rx.close();
         Poll::Ready(Ok(()))
     }

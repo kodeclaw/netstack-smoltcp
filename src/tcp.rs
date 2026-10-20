@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     pin::Pin,
     sync::{
@@ -60,9 +60,12 @@ struct TcpSocketControl {
 struct TcpSocketCreation {
     control: SharedControl,
     socket: TcpSocket<'static>,
+    flow: TcpFlow,
 }
 
 type SharedNotify = Arc<Notify>;
+type TcpFlow = (SocketAddr, SocketAddr);
+type ActiveFlows = Arc<Mutex<HashSet<TcpFlow>>>;
 
 /// Shared TCP socket control block.
 ///
@@ -83,10 +86,11 @@ impl TcpListenerRunner {
     ) -> Runner {
         Runner::new(async move {
             let notify = Arc::new(Notify::new());
+            let active_flows: ActiveFlows = Arc::new(Mutex::new(HashSet::new()));
             let (socket_tx, socket_rx) = channel::<TcpSocketCreation>(1024);
             let res = tokio::select! {
-                v = Self::handle_packet(notify.clone(), iface_ingress_tx, iface_ingress_tx_avail.clone(), tcp_rx, stream_tx, socket_tx) => v,
-                v = Self::handle_socket(notify, device, iface, iface_ingress_tx_avail, sockets, socket_rx) => v,
+                v = Self::handle_packet(notify.clone(), iface_ingress_tx, iface_ingress_tx_avail.clone(), tcp_rx, stream_tx, socket_tx, active_flows.clone()) => v,
+                v = Self::handle_socket(notify, device, iface, iface_ingress_tx_avail, sockets, socket_rx, active_flows) => v,
             };
             res?;
             trace!("VirtDevice::poll thread exited");
@@ -101,6 +105,7 @@ impl TcpListenerRunner {
         mut tcp_rx: Receiver<AnyIpPktFrame>,
         stream_tx: Sender<TcpStream>,
         socket_tx: Sender<TcpSocketCreation>,
+        active_flows: ActiveFlows,
     ) -> std::io::Result<()> {
         while let Some(frame) = tcp_rx.recv().await {
             let packet = match IpPacket::new_checked(&frame[..]) {
@@ -142,7 +147,8 @@ impl TcpListenerRunner {
             let dst_addr = SocketAddr::new(dst_ip, dst_port);
 
             // TCP first handshake packet, create a new Connection
-            if packet.syn() && !packet.ack() {
+            let flow = (src_addr, dst_addr);
+            if packet.syn() && !packet.ack() && !active_flows.lock().contains(&flow) {
                 let mut socket = TcpSocket::new(
                     TcpSocketBuffer::new(vec![0u8; DEFAULT_TCP_RECV_BUFFER_SIZE]),
                     TcpSocketBuffer::new(vec![0u8; DEFAULT_TCP_SEND_BUFFER_SIZE]),
@@ -169,6 +175,7 @@ impl TcpListenerRunner {
                     send_state: TcpSocketState::Normal,
                 }));
 
+                active_flows.lock().insert(flow);
                 stream_tx
                     .send(TcpStream {
                         src_addr,
@@ -179,7 +186,11 @@ impl TcpListenerRunner {
                     .await
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
                 socket_tx
-                    .send(TcpSocketCreation { control, socket })
+                    .send(TcpSocketCreation {
+                        control,
+                        socket,
+                        flow,
+                    })
                     .await
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
             }
@@ -202,12 +213,20 @@ impl TcpListenerRunner {
         iface_ingress_tx_avail: Arc<AtomicBool>,
         mut sockets: HashMap<SocketHandle, SharedControl>,
         mut socket_rx: Receiver<TcpSocketCreation>,
+        active_flows: ActiveFlows,
     ) -> std::io::Result<()> {
         let mut socket_set = SocketSet::new(vec![]);
+        let mut socket_flows = HashMap::new();
         loop {
-            while let Ok(TcpSocketCreation { control, socket }) = socket_rx.try_recv() {
+            while let Ok(TcpSocketCreation {
+                control,
+                socket,
+                flow,
+            }) = socket_rx.try_recv()
+            {
                 let handle = socket_set.add(socket);
                 sockets.insert(handle, control);
+                socket_flows.insert(handle, flow);
             }
 
             let before_poll = Instant::now();
@@ -255,6 +274,9 @@ impl TcpListenerRunner {
 
                     socket.close();
                     control.send_state = TcpSocketState::Closing;
+                    if let Some(waker) = control.send_waker.take() {
+                        waker.wake();
+                    }
                 }
 
                 // Check if readable
@@ -270,7 +292,11 @@ impl TcpListenerRunner {
                         Err(err) => {
                             // RecvError::Finished = remote peer sent FIN (graceful close).
                             // Use close() instead of abort() to avoid sending an unnecessary RST.
-                            trace!("socket recv finished: {:?}, state={:?}", err, socket.state());
+                            trace!(
+                                "socket recv finished: {:?}, state={:?}",
+                                err,
+                                socket.state()
+                            );
                             socket.close();
 
                             if matches!(control.recv_state, TcpSocketState::Normal) {
@@ -343,6 +369,9 @@ impl TcpListenerRunner {
             for socket_handle in sockets_to_remove {
                 sockets.remove(&socket_handle);
                 socket_set.remove(socket_handle);
+                if let Some(flow) = socket_flows.remove(&socket_handle) {
+                    active_flows.lock().remove(&flow);
+                }
             }
 
             if !iface_ingress_tx_avail.load(Ordering::Acquire) {
@@ -546,7 +575,10 @@ impl AsyncWrite for TcpStream {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let mut control = self.control.lock();
 
-        if matches!(control.send_state, TcpSocketState::Closed) {
+        if matches!(
+            control.send_state,
+            TcpSocketState::Closing | TcpSocketState::Closed
+        ) {
             return Ok(()).into();
         }
 
@@ -564,5 +596,36 @@ impl AsyncWrite for TcpStream {
         self.notify.notify_one();
 
         Poll::Pending
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::task::noop_waker;
+
+    #[test]
+    fn shutdown_completes_after_local_fin_is_requested() {
+        let control = Arc::new(Mutex::new(TcpSocketControl {
+            send_buffer: RingBuffer::new(vec![0; 8]),
+            send_waker: None,
+            recv_buffer: RingBuffer::new(vec![0; 8]),
+            recv_waker: None,
+            recv_state: TcpSocketState::Normal,
+            send_state: TcpSocketState::Closing,
+        }));
+        let mut stream = TcpStream {
+            src_addr: "192.0.2.1:12345".parse().unwrap(),
+            dst_addr: "198.51.100.2:443".parse().unwrap(),
+            notify: Arc::new(Notify::new()),
+            control,
+        };
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(
+            Pin::new(&mut stream).poll_shutdown(&mut cx).is_ready(),
+            "shutdown should complete after socket.close() queued the local FIN"
+        );
     }
 }
