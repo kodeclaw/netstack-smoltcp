@@ -255,7 +255,7 @@ async fn handle_inbound_datagram(udp_socket: UdpSocket, interface: String) {
 }
 
 async fn new_tcp_stream(addr: SocketAddr, iface: &str) -> std::io::Result<TcpStream> {
-    use socket2_ext::{AddressBinding, BindDeviceOption};
+    use socket2_ext::{AddressBinding, BindDeviceOption, socket2};
     let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?;
     socket.bind_to_device(BindDeviceOption::v4(iface))?;
     socket.set_keepalive(true)?;
@@ -270,7 +270,7 @@ async fn new_tcp_stream(addr: SocketAddr, iface: &str) -> std::io::Result<TcpStr
 }
 
 async fn new_udp_packet(addr: SocketAddr, iface: &str) -> std::io::Result<tokio::net::UdpSocket> {
-    use socket2_ext::{AddressBinding, BindDeviceOption};
+    use socket2_ext::{AddressBinding, BindDeviceOption, socket2};
     let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
     socket.bind_to_device(BindDeviceOption::v4(iface))?;
     socket.set_nonblocking(true)?;

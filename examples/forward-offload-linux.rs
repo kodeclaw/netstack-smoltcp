@@ -206,7 +206,7 @@ mod inner {
     }
 
     async fn new_tcp_stream(addr: SocketAddr, iface: &str) -> std::io::Result<TcpStream> {
-        use socket2_ext::{AddressBinding, BindDeviceOption};
+        use socket2_ext::{AddressBinding, BindDeviceOption, socket2};
         let s = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?;
         s.bind_to_device(BindDeviceOption::v4(iface))?;
         s.set_keepalive(true)?;
@@ -219,7 +219,7 @@ mod inner {
         addr: SocketAddr,
         iface: &str,
     ) -> std::io::Result<tokio::net::UdpSocket> {
-        use socket2_ext::{AddressBinding, BindDeviceOption};
+        use socket2_ext::{AddressBinding, BindDeviceOption, socket2};
         let s = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
         s.bind_to_device(BindDeviceOption::v4(iface))?;
         s.set_nonblocking(true)?;

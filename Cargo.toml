@@ -1,8 +1,8 @@
 [package]
 name = "netstack-smoltcp"
-version = "0.3.1"
+version = "0.3.3"
 edition = "2024"
-authors = ["cavivie <cavivie@gmail.com>", "Antigravity"]
+authors = ["cavivie <cavivie@gmail.com>", "Antigravity", "ChatGPT"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/kodeclaw/netstack-smoltcp"
 homepage = "https://github.com/kodeclaw/netstack-smoltcp"
@@ -13,16 +13,16 @@ description = """
 A netstack for the special purpose of turning packets from/to a TUN interface
 into TCP streams and UDP packets. It uses smoltcp-rs as the backend netstack.
 """
-rust-version = "1.91.0"
+rust-version = "1.99.0"
 
 [dependencies]
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
-tokio-util = "0.7.18"
-etherparse = "0.20"
+tokio-util = "0.7.20"
+etherparse = "0.21"
 futures = "0.3"
 rand = "0.10"
-smoltcp = { version = "0.13", default-features = false, features = [
+smoltcp = { version = "0.14", default-features = false, features = [
     "std",
     "log",
     "medium-ip",
@@ -32,7 +32,7 @@ smoltcp = { version = "0.13", default-features = false, features = [
     "socket-udp",
     "socket-tcp",
 ] }
-bytes = "1.11.1"
+bytes = "1.12.1"
 parking_lot = "0.12.5"
 
 [dev-dependencies]
@@ -48,5 +48,4 @@ tokio = { version = "1", features = [
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = "0.3.23"
 structopt = "0.3"
-socket2 = "0.5.10"
 socket2-ext = { version = "0.1" }
